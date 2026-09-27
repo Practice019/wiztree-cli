@@ -1,0 +1,84 @@
+name: tests
+
+# The unit suite is platform-independent and needs no WizTree, so it runs
+# everywhere. The E2E suite drives the real WizTree64.exe and therefore runs
+# only on Windows with WizTree installed; it is separated so a failure is
+# attributable rather than mysterious.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: unit tests (${{ matrix.os }} / py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: Show the CLI is importable and its entry point works
+        run: |
+          python -c "import cli_anything.wiztree, sys; print(cli_anything.wiztree.__file__)"
+          python -m cli_anything.wiztree --version
+
+      - name: Unit tests (no WizTree required)
+        run: python -m pytest src/cli_anything/wiztree/tests/test_core.py -q
+
+  e2e:
+    name: e2e tests (Windows + real WizTree)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install WizTree
+        shell: pwsh
+        run: |
+          # WizTree is proprietary and not redistributed here, so CI downloads
+          # the vendor installer. The version is resolved from the download page
+          # rather than hardcoded, so this does not go stale when vendors rotate
+          # filenames (wiztree_4_27_setup.exe -> wiztree_4_33_setup.exe, ...).
+          $page = Invoke-WebRequest -Uri 'https://diskanalyzer.com/download' -UseBasicParsing
+          $rel = [regex]::Match($page.Content, 'href="([^"]*wiztree[^"]*_setup\.exe)"').Groups[1].Value
+          if (-not $rel) { Write-Error 'could not resolve the WizTree installer link from the download page' }
+          $url = if ($rel -match '^https?://') { $rel } else { "https://diskanalyzer.com/$($rel.TrimStart('/'))" }
+          Write-Host "downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile wiztree_setup.exe
+          Start-Process -FilePath .\wiztree_setup.exe -Wait -ArgumentList `
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-'
+          # Confirm the installer put it where discovery will look.
+          $found = Get-ChildItem 'C:\Program Files*\WizTree\WizTree64.exe' -ErrorAction SilentlyContinue
+          if (-not $found) { Write-Error 'WizTree64.exe not found after install' }
+          $found.FullName
+
+      - name: Install the package and the test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install . pytest
+
+      - name: Show discovery works before running anything
+        run: cli-anything-wiztree info --json
+
+      - name: E2E tests (fail, never skip, if the backend is unusable)
+        env:
+          CLI_ANYTHING_FORCE_INSTALLED: "1"
+        run: python -m pytest src/cli_anything/wiztree/tests/test_full_e2e.py -q

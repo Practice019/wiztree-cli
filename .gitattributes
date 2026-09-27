@@ -1,0 +1,24 @@
+* text=auto eol=lf
+
+# Windows-only project, but the source is plain UTF-8 text.
+*.py    text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+*.cfg   text eol=lf
+*.txt   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# Never normalise or diff these as text
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.dll   binary
+*.exe   binary
+*.dmp   binary
+*.mft   binary
+*.pack  binary
+*.zip   binary
+
+# Exports people generate while trying the tool out
+*.csv   text eol=crlf

@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cli-anything-wiztree"
+version = "1.0.0"
+description = "Agent-native CLI for WizTree — scan Windows disks and query the results like a database"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "wiztree-cli contributors" }]
+keywords = ["wiztree", "disk-usage", "cli", "agent", "windows", "ntfs", "du"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Topic :: System :: Systems Administration",
+    "Topic :: System :: Filesystems",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = ["click>=8.0.0", "prompt-toolkit>=3.0.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/Practice019/wiztree-cli"
+Source = "https://github.com/Practice019/wiztree-cli"
+Issues = "https://github.com/Practice019/wiztree-cli/issues"
+
+[project.scripts]
+cli-anything-wiztree = "cli_anything.wiztree.wiztree_cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+# Explicitly scoped: `cli_anything` is a PEP 420 namespace package, so without
+# this filter discovery would also pick up any sibling `cli_anything.*` package
+# that happens to sit next to this project.
+packages = [
+    "cli_anything.wiztree",
+    "cli_anything.wiztree.core",
+    "cli_anything.wiztree.utils",
+    "cli_anything.wiztree.skills",
+    "cli_anything.wiztree.tests",
+]
+
+[tool.setuptools.package-data]
+"cli_anything.wiztree" = [
+    "README.md",
+    "skills/*.md",
+    "tests/TEST.md",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["src/cli_anything/wiztree/tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
