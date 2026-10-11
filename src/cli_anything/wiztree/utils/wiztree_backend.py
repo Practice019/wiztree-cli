@@ -627,6 +627,160 @@ def _default_runner(argv: Sequence[str], timeout: int) -> int:
     return completed.returncode
 
 
+#: The genuine runner, captured so the completion logic can tell a real scan
+#: from an injected test double.  A double never spawns WizTree, so probing for
+#: a live process would be both pointless and flaky under it.
+_REAL_DEFAULT_RUNNER = _default_runner
+
+#: Image names WizTree can be running under (the 64-bit binary and the 32-bit
+#: launcher that spawns it).
+_WIZTREE_IMAGES = ("WizTree64.exe", "WizTree.exe")
+
+
+def _wiztree_process_probe() -> bool:
+    """True while any WizTree process is alive.
+
+    Needed because ``/admin=1`` makes WizTree **self-elevate**: it launches an
+    elevated copy through ``ShellExecute(runas)`` and the original process
+    exits immediately.  The elevated child is the one that scans and writes the
+    export, so "the process I started has returned" is not the completion
+    signal -- its disappearance is.
+
+    The image name is compared **exactly**, never as a substring of the whole
+    listing.  Measured the hard way: this CLI installs an entry point called
+    ``cli-anything-wiztree.exe``, which contains ``wiztree.exe``, so a
+    substring test matched the CLI's *own* process and every scan then waited
+    out the full ``--timeout`` believing a writer was still running.
+
+    Returns:
+        ``False`` on any failure or on a non-Windows host, so a broken probe can
+        never turn into an infinite wait on a platform this cannot apply to.
+    """
+    if os.name != "nt":
+        return False
+
+    wanted = {image.lower() for image in _WIZTREE_IMAGES}
+    for image in _WIZTREE_IMAGES:
+        try:
+            # A filtered listing is far cheaper than dumping every process, and
+            # this runs once per poll for the whole length of a scan.
+            listed = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+        for line in listed.splitlines():
+            if not line.startswith('"'):
+                continue
+            # tasklist CSV: "Image Name","PID","Session Name","Session#","Mem Usage"
+            found = line[1:].split('","', 1)[0].strip().lower()
+            if found in wanted:
+                return True
+    return False
+
+
+def _artifact_is_readable(artifact: str) -> bool:
+    """True when the artifact can be opened for reading.
+
+    Measured: while the elevated child writes the export it holds the file with
+    an exclusive lock, so a concurrent read raises ``PermissionError``.  That is
+    a *not finished yet* signal, not a failure to report to the caller.
+    """
+    try:
+        with open(artifact, "rb") as handle:
+            handle.read(1)
+        return True
+    except OSError:
+        return False
+
+
+def _wait_for_complete_artifact(
+    artifact: str,
+    allowance: float,
+    *,
+    probe: Callable[[], bool] | None = None,
+    settle_seconds: float = 1.0,
+    poll_seconds: float = 0.5,
+) -> tuple[bool, float, str]:
+    """Wait until the export is *finished*, not merely started.
+
+    Three measured behaviours make "file exists and is non-empty" the wrong
+    completion test:
+
+    1. **The export is streamed.**  On a 331 GB volume the CSV was non-empty
+       within seconds and then grew 3.7 MB -> 818 MB.  Returning early hands the
+       parser a truncated file that still looks valid.
+    2. **The writer may not be the process that returned** (``/admin=1``
+       self-elevation), so a live process is the authoritative signal.
+    3. **The file is exclusively locked while being written**, so a read raises
+       ``PermissionError``.
+
+    Completion is therefore: no writer process, a size that has stopped moving
+    for *settle_seconds*, and a file that opens.
+
+    Args:
+        artifact: Path the export is being written to.
+        allowance: Maximum seconds to wait.
+        probe: ``() -> bool`` reporting a live writer; ``None`` disables it.
+        settle_seconds: How long the size must stay unchanged.
+        poll_seconds: Poll interval.
+
+    Returns:
+        ``(complete, waited_seconds, reason)`` -- *reason* is a short diagnostic
+        string suitable for an error message.
+    """
+    started = time.time()
+    deadline = started + max(0.0, allowance)
+    last_size = -1
+    stable_since: float | None = None
+    reason = "no artifact appeared"
+
+    while True:
+        try:
+            size = os.path.getsize(artifact)
+        except OSError:
+            size = -1
+
+        # Cheap signals first, and once the artifact exists the decision is made
+        # on the artifact itself.  The process probe is consulted ONLY while
+        # nothing has been written yet, because "is the elevated child alive?" is
+        # the only question it can actually answer.
+        #
+        # Measured the hard way: probing for *any* WizTree process on every poll
+        # let an unrelated instance left over from an earlier run -- still alive
+        # 11 hours later, PID 34096 -- veto completion forever.  A scan that had
+        # already written its 63.67 MB file sat there until the full --timeout.
+        # A stale process cannot keep growing the file, so the artifact's own
+        # size and lock state are the authoritative signals.
+        writer_alive = bool(probe()) if (size <= 0 and probe is not None) else False
+
+        if size > 0 and _artifact_is_readable(artifact) and not writer_alive:
+            if size == last_size:
+                if stable_since is None:
+                    stable_since = time.time()
+                elif time.time() - stable_since >= settle_seconds:
+                    return True, time.time() - started, "artifact complete"
+            else:
+                stable_since = None
+        else:
+            stable_since = None
+            if writer_alive:
+                reason = "no artifact yet and a WizTree process is running"
+            elif size > 0 and not _artifact_is_readable(artifact):
+                reason = "the artifact is still exclusively locked by its writer"
+            elif size == 0:
+                reason = "the artifact is still empty"
+
+        last_size = size
+        if time.time() >= deadline:
+            return False, time.time() - started, reason
+        time.sleep(poll_seconds)
+
+
 def _preflight_output(artifact: str) -> None:
     """Fail fast when the destination cannot be written.
 
@@ -679,14 +833,28 @@ def _run_and_validate(
     hint: str = "",
     grace_seconds: float = 15.0,
     exe: str = "",
+    process_probe: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    """Run *argv*, then require a non-empty *artifact* at *artifact*.
+    """Run *argv*, then require a *finished*, non-empty *artifact* at *artifact*.
 
     The stale file is removed first so a previous run can never be mistaken for
-    this one's output.  After the process returns, the artifact is given
-    *grace_seconds* to appear: the 32-bit ``wiztree.exe`` build only launches the
-    64-bit one and returns immediately, so judging on "process exited, no file"
-    would report a false failure while the export is still being written.
+    this one's output.
+
+    Two measured traps make the naive "process exited + file is non-empty" test
+    wrong, and both are handled here:
+
+    * **Self-elevation.**  ``/admin=1`` makes WizTree relaunch itself elevated
+      via ``ShellExecute(runas)``; the process this function started returns
+      immediately while the elevated child is still scanning.  A fixed
+      *grace_seconds* therefore expires mid-scan and the caller is told "no
+      output" for a scan that is running perfectly.  When a live WizTree process
+      is detected the wait is extended to *timeout*, which is the only bound the
+      caller actually promised.
+    * **Streamed output.**  The CSV becomes non-empty within seconds and then
+      keeps growing, so a non-empty file is not a finished file.  Completion is
+      delegated to :func:`_wait_for_complete_artifact`, which also treats the
+      writer's exclusive lock as "still going" instead of surfacing a raw
+      ``PermissionError`` to the caller.
     """
     _preflight_output(artifact)
     if os.path.exists(artifact):
@@ -698,6 +866,14 @@ def _run_and_validate(
             ) from exc
 
     run = runner or _default_runner
+    # Probing for a live process only makes sense when WizTree was really
+    # launched; under an injected runner the probe would be both meaningless and
+    # a source of flakiness (it would see any user-started WizTree GUI).
+    if process_probe is not None:
+        probe: Callable[[], bool] | None = process_probe
+    else:
+        probe = _wiztree_process_probe if run is _REAL_DEFAULT_RUNNER else None
+
     started = time.time()
     try:
         exit_code = run(list(argv), timeout)
@@ -712,13 +888,41 @@ def _run_and_validate(
         raise WizTreeExportError(f"Could not launch WizTree: {exc}") from exc
     process_ms = int((time.time() - started) * 1000)
 
+    def _looks_complete() -> bool:
+        """Done = a non-empty artifact that can be opened right now.
+
+        Deliberately does **not** ask whether a WizTree process exists: an
+        unrelated instance running for any reason is not evidence about *this*
+        artifact, and treating it as one makes the whole command wait out
+        ``--timeout`` for a scan that finished long ago.  A live writer still
+        holds the file locked, which :func:`_artifact_is_readable` already
+        reports, and a growing file is caught by the stability check.
+        """
+        try:
+            if os.path.getsize(artifact) <= 0:
+                return False
+        except OSError:
+            return False
+        return _artifact_is_readable(artifact)
+
     waited_ms = 0
-    if not (os.path.exists(artifact) and os.path.getsize(artifact) > 0):
+    wait_reason = ""
+    if not _looks_complete():
         wait_started = time.time()
         # A launcher-only build returns before its child has written anything, so
         # give it longer than the usual asynchronous-write grace period.
         allowance = max(grace_seconds, 30.0) if is_launcher_only(exe or argv[0]) else grace_seconds
-        _wait_for_artifact(artifact, allowance)
+        # Only while nothing exists yet does a live process mean "still working":
+        # that is the self-elevation case, where the elevated child has not
+        # produced a file at all.  Widen the bound to the caller's own --timeout
+        # rather than a 15 s guess made before the scan even started.
+        try:
+            nothing_yet = os.path.getsize(artifact) <= 0
+        except OSError:
+            nothing_yet = True
+        if nothing_yet and probe is not None and probe():
+            allowance = max(allowance, float(timeout))
+        _wait_for_complete_artifact(artifact, allowance, probe=probe)
         waited_ms = int((time.time() - wait_started) * 1000)
 
     if not os.path.exists(artifact) or os.path.getsize(artifact) == 0:
@@ -731,6 +935,14 @@ def _run_and_validate(
             "  - the drive is not NTFS and the scan was refused\n"
             "  - the filter matched nothing, which WizTree reports by writing nothing at all\n"
             + (f"  - {hint}\n" if hint else "")
+        )
+
+    if not _artifact_is_readable(artifact):
+        raise WizTreeExportError(
+            f"WizTree produced {kind} at {artifact} but the file is still exclusively "
+            f"locked by its writer after {waited_ms} ms, so it cannot be read yet.\n"
+            "A streamed export is only safe to parse once the writing process has "
+            "exited; wait for WizTree to close the file and retry."
         )
 
     return {
@@ -754,6 +966,7 @@ def run_export(
     timeout: int = 1800,
     grace_seconds: float = 15.0,
     runner: Runner | None = None,
+    process_probe: Callable[[], bool] | None = None,
     **opts: Any,
 ) -> dict[str, Any]:
     """Scan *target* and write a CSV export to *export_path*.
@@ -781,6 +994,7 @@ def run_export(
     result = _run_and_validate(
         argv, export_path, kind="CSV export", timeout=timeout, runner=runner,
         subject=target, exe=resolved_exe, grace_seconds=grace_seconds,
+        process_probe=process_probe,
         hint="if the target needs elevation, re-run with --admin (or from an elevated shell)",
     )
     result["csv_path"] = export_path

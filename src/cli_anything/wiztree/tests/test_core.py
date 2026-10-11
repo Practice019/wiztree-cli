@@ -985,3 +985,328 @@ class TestLauncherAndDiscoveryOrder:
         monkeypatch.setenv("ProgramFiles(x86)", r"C:\Program Files")
         candidates = wb._env_candidates()
         assert len(candidates) == len(set(candidates))
+
+
+# ── F4: the export is streamed, so "non-empty" is not "finished" ───────
+#
+# Measured on a 331 GB volume: /admin=1 makes WizTree self-elevate, so the
+# process the CLI started returns at once while the elevated child keeps
+# scanning.  The CSV is non-empty within seconds and then grows
+# (3.7 MB -> 818 MB) and is held with an exclusive lock the whole time.
+# A fixed post-return grace therefore reported "produced no output" for a scan
+# that was running perfectly, and a naive non-empty test would have parsed a
+# truncated file.
+
+class TestStreamedArtifactCompletion:
+
+    # Synthetic `tasklist /FO CSV /NH` bodies. The first is the exact output
+    # shape that caused a real hang: this CLI installs as
+    # `cli-anything-wiztree.exe`, whose name *contains* "wiztree.exe".
+    TASKLIST_CLI_ONLY = '"cli-anything-wiztree.exe","41416","Console","1","3,896 K"\n'
+    TASKLIST_WITH_WIZTREE = (
+        '"cli-anything-wiztree.exe","41416","Console","1","3,896 K"\n'
+        '"WizTree64.exe","40212","Console","1","2,051,384 K"\n'
+    )
+    TASKLIST_SYSTEM_ONLY = '"svchost.exe","1100","Services","0","12,000 K"\n'
+
+    def _stub_tasklist(self, monkeypatch, output):
+        class _Completed:
+            stdout = output
+
+        def fake_run(*args, **kwargs):
+            return _Completed()
+
+        monkeypatch.setattr(wb.subprocess, "run", fake_run)
+
+    def test_the_cli_own_process_is_not_mistaken_for_wiztree(self, monkeypatch):
+        """Regression: a substring match made the CLI's own `...wiztree.exe`
+        look like a live writer, so every scan waited out --timeout (1800 s)."""
+        self._stub_tasklist(monkeypatch, self.TASKLIST_CLI_ONLY)
+        assert wb._wiztree_process_probe() is False
+
+    def test_a_real_wiztree_process_is_detected(self, monkeypatch):
+        self._stub_tasklist(monkeypatch, self.TASKLIST_WITH_WIZTREE)
+        assert wb._wiztree_process_probe() is True
+
+    def test_unrelated_processes_are_not_detected(self, monkeypatch):
+        self._stub_tasklist(monkeypatch, self.TASKLIST_SYSTEM_ONLY)
+        assert wb._wiztree_process_probe() is False
+
+    def test_a_broken_tasklist_is_not_a_live_writer(self, monkeypatch):
+        """A probe that cannot run must never be read as 'still writing'."""
+        def boom(*args, **kwargs):
+            raise OSError("tasklist went away")
+
+        monkeypatch.setattr(wb.subprocess, "run", boom)
+        assert wb._wiztree_process_probe() is False
+
+    def _fake_exe(self, tmp_path, name="WizTree64.exe"):
+        exe = tmp_path / name
+        exe.write_bytes(b"MZ")
+        return str(exe)
+
+    def test_no_artifact_with_a_writer_alive_is_not_completion(self, tmp_path):
+        """While nothing has been written yet, a live process is the best signal
+        available — that is exactly the self-elevation case."""
+        artifact = tmp_path / "growing.csv"
+        complete, _waited, reason = wb._wait_for_complete_artifact(
+            str(artifact), allowance=0.5, probe=lambda: True,
+            settle_seconds=0.0, poll_seconds=0.05,
+        )
+        assert complete is False
+        assert "process is running" in reason
+
+    def test_an_existing_artifact_beats_a_stale_writer(self, tmp_path):
+        """Regression: an unrelated WizTree process must not veto completion.
+
+        Measured the hard way — a WizTree instance left over from an earlier run
+        (still alive 11 hours later, PID 34096) made a scan that had already
+        written its 63.67 MB export sit until the full ``--timeout``, because the
+        probe treated *any* WizTree process as "the writer".  A stale process
+        cannot keep growing the file, so the artifact's own state is what counts.
+        """
+        artifact = tmp_path / "already-done.csv"
+        artifact.write_text(CSV_EN_PLAIN, encoding="utf-8")
+        complete, _waited, _reason = wb._wait_for_complete_artifact(
+            str(artifact), allowance=5.0, probe=lambda: True,
+            settle_seconds=0.2, poll_seconds=0.05,
+        )
+        assert complete is True, "an unrelated live process must not block a finished export"
+
+    def test_a_ready_artifact_is_accepted_without_consulting_the_probe(self, tmp_path):
+        """`_run_and_validate` must not pay for a process probe when the file is ready."""
+        exe = tmp_path / "WizTree64.exe"
+        exe.write_bytes(b"MZ")
+        out = tmp_path / "ready.csv"
+
+        def runner(argv, timeout):
+            out.write_text(CSV_EN_PLAIN, encoding="utf-8")
+            return 0
+
+        def exploding_probe():
+            raise AssertionError("the probe must not run once the artifact is ready")
+
+        result = wb._run_and_validate(
+            [str(exe), "D:", "/export=x"], str(out), kind="CSV export",
+            timeout=60, runner=runner, exe=str(exe),
+            grace_seconds=0.0, process_probe=exploding_probe,
+        )
+        assert result["success"] is True
+
+    def test_completion_requires_the_size_to_settle(self, tmp_path):
+        """A file that is non-empty and unlocked but still growing is not done."""
+        artifact = tmp_path / "settling.csv"
+        artifact.write_text("x" * 100, encoding="utf-8")
+
+        import threading
+
+        def grow():
+            time.sleep(0.15)
+            with open(artifact, "a", encoding="utf-8") as handle:
+                handle.write("y" * 5000)
+
+        threading.Thread(target=grow, daemon=True).start()
+        complete, _waited, _reason = wb._wait_for_complete_artifact(
+            str(artifact), allowance=5.0, probe=None, settle_seconds=0.4, poll_seconds=0.05
+        )
+        assert complete is True
+        assert artifact.stat().st_size > 5000  # the growth was waited out
+
+    def test_locked_artifact_is_reported_as_not_finished(self, tmp_path):
+        """An exclusive lock is a 'still writing' signal, not a raw PermissionError."""
+        artifact = tmp_path / "locked.csv"
+        artifact.write_text(CSV_EN_PLAIN, encoding="utf-8")
+
+        def locked(_path):
+            return False
+
+        original = wb._artifact_is_readable
+        try:
+            wb._artifact_is_readable = locked  # type: ignore[assignment]
+            complete, _waited, reason = wb._wait_for_complete_artifact(
+                str(artifact), allowance=0.3, probe=None, settle_seconds=0.0, poll_seconds=0.05
+            )
+        finally:
+            wb._artifact_is_readable = original  # type: ignore[assignment]
+        assert complete is False
+        assert "locked" in reason
+
+    def test_elevated_child_extends_the_wait_to_timeout(self, tmp_path, monkeypatch):
+        """Regression: with a live writer the wait must use --timeout, not the
+        15 s grace, or a real admin scan is declared a failure mid-flight.
+
+        Measured: `/admin=1` self-elevates, the launcher returns in ~7 s, and a
+        331 GB folders-only export needs 24.7 s.  Under the old fixed grace the
+        CLI reported "produced no output" for a scan that finished correctly.
+        """
+        exe = self._fake_exe(tmp_path)
+        out = tmp_path / "admin.csv"
+        seen: dict[str, float] = {}
+
+        def fake_wait(artifact, allowance, *, probe=None, **kwargs):
+            seen["allowance"] = allowance
+            out.write_text(CSV_EN_PLAIN, encoding="utf-8")
+            return True, 0.0, "ok"
+
+        monkeypatch.setattr(wb, "_wait_for_complete_artifact", fake_wait)
+        result = wb._run_and_validate(
+            [exe, "D:", "/export=x"], str(out), kind="CSV export",
+            timeout=1234, runner=lambda argv, timeout: 0, exe=exe,
+            grace_seconds=15.0, process_probe=lambda: True,
+        )
+        assert result["success"] is True
+        assert seen["allowance"] == 1234.0, "a live writer must widen the wait to --timeout"
+
+    def test_no_live_writer_keeps_the_short_grace(self, tmp_path, monkeypatch):
+        """A probe that reports nothing running must not make failures slow."""
+        exe = self._fake_exe(tmp_path)
+        out = tmp_path / "gone.csv"
+        seen: dict[str, float] = {}
+
+        def fake_wait(artifact, allowance, *, probe=None, **kwargs):
+            seen["allowance"] = allowance
+            return False, 0.0, "nothing"
+
+        monkeypatch.setattr(wb, "_wait_for_complete_artifact", fake_wait)
+        with pytest.raises(wb.WizTreeExportError):
+            wb._run_and_validate(
+                [exe, "Z:\\nope", "/export=x"], str(out), kind="CSV export",
+                timeout=1234, runner=lambda argv, timeout: 0, exe=exe,
+                grace_seconds=15.0, process_probe=lambda: False,
+            )
+        assert seen["allowance"] == 15.0
+
+
+class TestIndexCache:
+    """The sidecar index: every `query` reloads the export, so re-parsing it
+    once per question was the dominant cost of the CLI (18.2 s -> 3.8 s)."""
+
+    def _big_csv(self, tmp_path, name="big.csv", rows=40_000):
+        path = tmp_path / name
+        lines = [BANNER_EN, "File Name,Size,Allocated,Modified,Attributes,Files,Folders"]
+        for i in range(rows):
+            lines.append(f'"C:\\test\\f{i}.bin",{i + 1},4096,2026/01/02 03:04:05,32,0,0')
+        path.write_text("\n".join(lines), encoding="utf-8-sig")
+        return str(path)
+
+    def test_cache_is_written_and_reused(self, tmp_path, monkeypatch):
+        csv = self._big_csv(tmp_path)
+        monkeypatch.setattr(index, "CACHE_MIN_BYTES", 1)
+        first, meta_first = index.parse_export_csv(csv)
+        assert meta_first["cache"] == "miss"
+        assert os.path.exists(index.index_cache_path(csv))
+        second, meta_second = index.parse_export_csv(csv)
+        assert meta_second["cache"] == "hit"
+        assert [e.name for e in second] == [e.name for e in first]
+        assert [e.allocated for e in second] == [e.allocated for e in first]
+
+    def test_cache_is_invalidated_when_the_export_changes(self, tmp_path, monkeypatch):
+        csv = self._big_csv(tmp_path)
+        monkeypatch.setattr(index, "CACHE_MIN_BYTES", 1)
+        index.parse_export_csv(csv)
+        with open(csv, "a", encoding="utf-8-sig") as handle:
+            handle.write('\n"C:\\test\\extra.bin",999,4096,2026/01/02 03:04:05,32,0,0')
+        _entries, meta = index.parse_export_csv(csv)
+        assert meta["cache"] == "miss", "a changed export must not be served from cache"
+
+    def test_env_var_disables_the_cache(self, tmp_path, monkeypatch):
+        csv = self._big_csv(tmp_path)
+        monkeypatch.setattr(index, "CACHE_MIN_BYTES", 1)
+        monkeypatch.setenv(index.CACHE_DISABLE_ENV, "1")
+        index.parse_export_csv(csv)
+        assert not os.path.exists(index.index_cache_path(csv))
+
+    def test_small_exports_are_not_cached(self, tmp_path):
+        csv = _write(tmp_path, "small.csv", CSV_EN_PLAIN)
+        index.parse_export_csv(csv)
+        assert not os.path.exists(index.index_cache_path(csv))
+
+    def test_a_planted_cache_cannot_execute_code(self, tmp_path):
+        """The cache sits next to the export, so a hostile pickle must not run."""
+        import pickle as _pickle
+
+        class Evil:
+            def __reduce__(self):
+                return (os.system, ("echo pwned",))
+
+        csv = _write(tmp_path, "victim.csv", CSV_EN_PLAIN)
+        with open(index.index_cache_path(csv), "wb") as handle:
+            _pickle.dump({"signature": index._cache_signature(csv),
+                          "entries": [Evil()], "meta": {}}, handle)
+        assert index.load_index_cache(csv) is None
+        entries, meta = index.parse_export_csv(csv)
+        assert len(entries) == 4
+        assert meta["cache"] in ("miss", "hit")
+
+    def test_corrupt_cache_falls_back_to_parsing(self, tmp_path, monkeypatch):
+        csv = self._big_csv(tmp_path, rows=200)
+        monkeypatch.setattr(index, "CACHE_MIN_BYTES", 1)
+        index.parse_export_csv(csv)
+        with open(index.index_cache_path(csv), "wb") as handle:
+            handle.write(b"not a pickle at all")
+        entries, meta = index.parse_export_csv(csv)
+        assert meta["cache"] == "miss"
+        assert len(entries) == 200
+
+
+class TestHotPathCoercion:
+    """`_to_int` runs 5x per row -- 3.26 M calls on a real volume -- and the
+    shortcut added for it must not change what the parser accepts."""
+
+    @pytest.mark.parametrize("value,expected", [
+        ("20702725", 20702725), (" 42 ", 42), ('"7"', 7), ("-5", -5),
+        ("+8", 8), ("3.9", 3), ("", 0), ("abc", 0), ("0x10", 0),
+        (12, 12), (12.7, 12), (True, 1), (None, 0),
+    ])
+    def test_to_int_accepts_the_same_forms(self, value, expected):
+        assert index._to_int(value) == expected
+
+    @pytest.mark.parametrize("value,expected", [
+        ("12", True), (" 12 ", True), ("-5", True), ("", False),
+        ("12a", False), ("1.5", False), ("abc", False),
+        # Non-ASCII digits: Python's `\d` is Unicode-aware, so the *original*
+        # regex accepted these too.  The fast path deliberately routes them to
+        # the regex rather than deciding them itself, keeping the language
+        # identical -- this case pins that down.
+        ("１２３", True),
+    ])
+    def test_is_int_keeps_its_accepting_language(self, value, expected):
+        assert index._is_int(value) is expected
+
+    def test_quoted_and_ragged_rows_still_parse(self, tmp_path):
+        entries, meta = index.parse_export_csv(
+            _write(tmp_path, "zh.csv", CSV_ZH_WITH_CAPACITY)
+        )
+        assert meta["skipped_rows"] == []
+        assert [e.name for e in entries] == [
+            "D:\\sample\\", "D:\\sample\\locale\\", "D:\\sample\\locale\\a.txt",
+            "D:\\sample\\big, with comma.bin",
+        ]
+
+
+class TestEncodingSniffing:
+    """Streaming needs the codec up front; guessing wrong must degrade to the
+    whole-file path rather than produce mojibake."""
+
+    def test_utf8_bom(self, tmp_path):
+        csv = _write(tmp_path, "bom.csv", CSV_EN_PLAIN, encoding="utf-8-sig")
+        assert index._sniff_encoding(csv)[0] == "utf-8-sig"
+
+    def test_cp936_banner_selects_the_chinese_code_page(self, tmp_path):
+        csv = _write(tmp_path, "zh.csv", CSV_ZH_WITH_CAPACITY, encoding="cp936")
+        encoding, fallback = index._sniff_encoding(csv)
+        assert encoding in ("cp936", "gbk")
+        assert fallback is False
+
+    def test_utf16_bom_is_detected(self, tmp_path):
+        csv = _write(tmp_path, "u16.csv", CSV_EN_PLAIN, encoding="utf-16")
+        assert index._sniff_encoding(csv)[0] == "utf-16"
+        entries, _meta = index.parse_export_csv(csv)
+        assert len(entries) == 4
+
+    def test_cp936_export_round_trips_through_streaming(self, tmp_path):
+        csv = _write(tmp_path, "zh.csv", CSV_ZH_WITH_CAPACITY, encoding="cp936")
+        entries, meta = index.parse_export_csv(csv)
+        assert len(entries) == 4
+        assert meta["encoding_fallback"] is False
+        assert entries[0].name == "D:\\sample\\"
