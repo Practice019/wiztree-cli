@@ -32,6 +32,19 @@ Two more were found later by adversarial review and fixed:
 | **The 32-bit build is a launcher** that spawns the 64-bit one and returns immediately | Judging on "process exited, no file" reports a false failure; discovery prefers 64-bit and the driver waits for the artifact |
 | **An unwritable destination opens a modal dialog** that never closes | 30 minutes of silence on a default timeout; the output directory is now probed *before* WizTree starts |
 
+And two more were found by driving the tool against a real 331 GB volume:
+
+| Behaviour | Consequence |
+|---|---|
+| **`/admin=1` self-elevates.** WizTree relaunches itself through `ShellExecute(runas)`; the process the CLI started returns in seconds while the elevated child is still scanning | A fixed post-return grace expired mid-scan and reported "produced no output" for a scan that was running perfectly. A live WizTree process now extends the wait to `--timeout` |
+| **The export is streamed, and locked while it is written.** The CSV was non-empty within seconds and then grew 3.7 MB → 818 MB, held with an exclusive lock throughout | "File exists and is non-empty" is not "finished": it would hand the parser a truncated file, and a concurrent read raised a bare `PermissionError`. Completion now means *no writer process + a size that stopped moving + a file that opens* |
+
+The same run also produced the throughput numbers that shaped the parser:
+**folders-only (`--folders-only`) exported 653k rows / 103 MB in 24.7 s, where the
+full file-level export was 8.14 M rows / 818 MB and took minutes.** If the
+question is "what is filling this disk", folder rows are the whole answer — file
+rows cost 8× the time and 8× the space to say the same thing.
+
 ## Requirements
 
 - **Windows** (WizTree is Windows-only; the macOS build needs its own arg builder)
@@ -134,6 +147,85 @@ cli-anything-wiztree query types -n 15
 `query dups` matches on **name + size**, which is WizTree's own duplicate rule — it
 never compares contents. Verify before deleting.
 
+### `index` — build once, then stay fresh
+
+Every `scan run` re-reads the whole volume. Measured on a 331 GB volume with
+3.3 M files, that is ~25 s for the scan plus the export and parse on top. The
+`index` commands pay it **once** and then apply only what changed, using the
+NTFS USN change journal — the same mechanism Everything is built on.
+
+```bash
+cli-anything-wiztree index build "D:" -o index_D.live   # once
+cli-anything-wiztree index sync  "D:" -o index_D.live   # after that
+cli-anything-wiztree index status --index index_D.live
+cli-anything-wiztree index top   --index index_D.live -n 20
+cli-anything-wiztree index find  "_cache" --index index_D.live
+```
+
+Measured end to end on `D:` (3,593,757 entries: 476,820 folders, 3,116,937 files):
+
+| Stage | Time | Notes |
+|---|---:|---|
+| `$MFT` dump | **16.5 s** | 5.30 GiB raw, written by WizTree |
+| parse (8 processes) | **44.0 s** | fixed-size records, sharded by byte range |
+| recursive folder totals | **27.6 s** | paid here so queries never re-roll the volume |
+| save | **6.5 s** | 123 MB index |
+| **`index build` total** | **~102 s** | once |
+| **`index sync`** — journal read | **0.02–0.14 s** | thousands of records, not millions |
+| `index top` — query | **0.5 s** | reads the stored totals |
+| `index status` | **3.1 s** | metadata only, no node materialization |
+
+Why the dump-and-parse route instead of WizTree's own file-level CSV export: the
+CSV is 818 MB / 8.14 M rows and takes **~190 s** end to end, because it is text
+that has to be re-parsed. The raw `$MFT` is a flat array of fixed-size records
+keyed by the same file reference number the USN journal uses, so it parses faster
+*and* needs no join.
+
+Two correctness notes from building it, both of which produce a *silently wrong*
+index rather than an error:
+
+* **A folder-target scan emits synthetic record numbers.** WizTree reported the
+  scanned root as record 5 — the volume root — where `fsutil file queryfileid`
+  and the USN journal both say 3665549. Only a **volume** scan yields real ones,
+  so `index build` always scans the volume.
+* **An FRN is not a record number.** The low 48 bits are the record number; the
+  high 16 are a reuse sequence number. Comparing them raw matches nothing.
+
+`index sync` refuses rather than guesses when the delta cannot be trusted: if the
+journal was reset, or wrapped past the checkpoint, it raises and tells you to
+rebuild. A non-zero `orphans` count in the result means records referenced a
+parent the index does not hold, i.e. there is a hole.
+
+Still single-process: everything above the journal read (loading 3.59 M entries
+costs ~18 s, and a sync rewrites the 123 MB index). A daemon holding the index
+resident — which is exactly why Everything runs as a service — is the next step;
+the mechanism itself is already millisecond-scale.
+
+### The sidecar index (why the second question is fast)
+
+`scan run` parses the export once and memoizes the result in
+`<export>.wiztree-index.pkl` beside it, because *every* `query` subcommand loads
+the whole export. Without it, asking a second question about the same scan
+re-parsed the file from scratch.
+
+Measured on a 653k-row / 99 MB folders-only export:
+
+| | Before | After |
+|---|---:|---:|
+| First parse (cold) | 18.2 s | 8.2 s |
+| Repeat query (cache hit) | 18.2 s | **3.8 s** |
+
+The cache is keyed on `(size, mtime_ns, version)`, so a re-export invalidates it
+automatically, and it is only written for exports over 4 MB — below that the
+parse is already faster than the bookkeeping. A corrupt or foreign cache is
+ignored and the file is re-parsed; unpickling is restricted to the entry class,
+so a planted cache can produce wrong numbers but never run code. The sidecar
+costs ~1.2× the export's size on disk (121 MB for a 99 MB export). To opt out:
+
+```bash
+export CLI_ANYTHING_WIZTREE_NO_CACHE=1     # PowerShell: $env:CLI_ANYTHING_WIZTREE_NO_CACHE=1
+```
+
 ### Other WizTree export modes
 
 ```bash
@@ -218,6 +310,10 @@ for the test plan, the reconnaissance findings, the recorded results, and the
 - **`query dups` is a candidate list, not proof.** Base name + size only; file
   contents are never compared. Hard links are not excluded from the reclaimable
   estimate, so that figure can be optimistic.
+- **The sidecar index costs disk.** A cache hit on a 99 MB export costs 3.8 s
+  instead of 8.2 s, but the `.wiztree-index.pkl` beside it is ~121 MB. Delete the
+  sidecar to reclaim it; it is rebuilt on the next parse. `scan mft` and
+  `scan treemap` are not cached at all.
 - **Logical size ≠ on-disk usage.** WizTree reports hard-linked files once per link
   (measured: 135.8 GB logical vs 119.0 GB allocated on a test volume). Use
   `--by allocated` for capacity questions.

@@ -36,6 +36,8 @@ Environment:
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -781,6 +783,239 @@ def session_redo():
         output(entry.to_dict(), f"✓ Redone: {entry.command}")
     else:
         output({"error": "Nothing to redo"}, "Nothing to redo")
+
+
+# ── index (incremental, USN-journal maintained) ───────────────────────
+
+@cli.group("index")
+def index_group():
+    """Build once, then keep a full-disk index fresh from the NTFS USN journal.
+
+    `scan run` re-reads the whole volume every time.  These commands pay that
+    cost once and then apply only what changed, so repeated questions stay in
+    the sub-second range on a volume that takes ~25 s to scan.
+    """
+
+
+def _index_path(explicit: str | None, drive: str) -> str:
+    if explicit:
+        return explicit
+    slug = drive.rstrip(":\\/")[:1] or "volume"
+    return os.path.join(scans_dir(), f"index_{slug}.live")
+
+
+@index_group.command("build")
+@click.argument("drive")
+@click.option("--output", "-o", "destination", default=None,
+              help="Index file (default: <state>/scans/index_<drive>.live).")
+@click.option("--dump", "dump_path", default=None,
+              help="Where to write the raw $MFT dump (default: alongside the index).")
+@click.option("--workers", type=int, default=None,
+              help="Parse processes (default: min(8, CPUs); 1 = in-process).")
+@click.option("--keep-dump", is_flag=True, help="Do not delete the $MFT dump afterwards.")
+@with_globals
+@handle_error
+def index_build(drive, destination, dump_path, workers, keep_dump):
+    """Full build from a raw $MFT dump: the only expensive step."""
+    from cli_anything.wiztree.core import liveindex
+
+    target = _index_path(destination, drive)
+    dump_path = dump_path or f"{target}.mft"
+
+    def progress(done, total):
+        if not _state["json"] and total:
+            click.echo(f"\r  parsing {done:,}/{total:,} records…", nl=False, err=True)
+
+    started = time.perf_counter()
+    index, timings = liveindex.build_index(
+        drive, dump_path=dump_path, workers=workers,
+        keep_dump=keep_dump, progress=progress,
+    )
+    if not _state["json"]:
+        click.echo("", err=True)
+
+    started_save = time.perf_counter()
+    saved_bytes = index.save(target)
+    timings["save_seconds"] = round(time.perf_counter() - started_save, 2)
+    timings["index_bytes"] = saved_bytes
+    timings["index_path"] = target
+    timings["total_seconds"] = round(time.perf_counter() - started, 2)
+    timings["folders"] = sum(1 for n in index.nodes.values() if n.is_dir)
+    timings["files"] = len(index.nodes) - timings["folders"]
+
+    payload = {"drive": drive, **timings}
+    output(
+        payload,
+        f"✓ {len(index.nodes):,} entries indexed in {timings['total_seconds']:.1f}s\n"
+        f"  dump {timings['dump_seconds']:.1f}s + parse {timings['parse_seconds']:.1f}s"
+        f" + save {timings['save_seconds']:.1f}s\n"
+        f"  {target} ({saved_bytes / 1024 / 1024:.1f} MB)",
+    )
+
+
+@index_group.command("sync")
+@click.argument("drive")
+@click.option("--index", "index_path_opt", default=None, help="Index file to update.")
+@with_globals
+@handle_error
+def index_sync(drive, index_path_opt):
+    """Apply only what the USN journal recorded since the last checkpoint."""
+    from cli_anything.wiztree.core import liveindex
+
+    target = _index_path(index_path_opt, drive)
+    index = liveindex.LiveIndex.load(target)
+
+    # Route progress to stderr so it cannot corrupt a piped --json document.
+    started = time.perf_counter()
+    if _state["json"]:
+        with contextlib.redirect_stderr(io.StringIO()):
+            result = index.sync(save_to=target)
+    else:
+        result = index.sync(save_to=target)
+    result["total_seconds"] = round(time.perf_counter() - started, 2)
+    result["index_path"] = target
+    applied = result["applied"]
+    output(
+        result,
+        f"✓ synced {index.drive}: {result['records_read']:,} journal records in "
+        f"{result['read_seconds']:.2f}s ({result['strategy']})\n"
+        f"  +{applied['created']} -{applied['deleted']} ~{applied['renamed']} "
+        f"size{applied['resized']}  orphans {applied['orphans']}\n"
+        f"  {result['entries']:,} entries, checkpoint USN {result['checkpoint_usn']}",
+    )
+
+
+@index_group.command("status")
+@click.option("--index", "index_path_opt", required=True, help="Index file to inspect.")
+@with_globals
+@handle_error
+def index_status(index_path_opt):
+    """Report how stale an index is and whether incremental sync is still possible."""
+    from cli_anything.wiztree.core import liveindex
+
+    # `peek` deliberately avoids building the 3.59 M node objects: measuring
+    # showed that step alone costs 14.6 s, and status needs none of it.
+    meta = liveindex.LiveIndex.peek(index_path_opt)
+    info = {
+        "drive": meta["drive"],
+        "index_path": index_path_opt,
+        "entries": meta["entries"],
+        "folders": meta["folders"],
+        "built_at": meta["built_at"],
+        "synced_at": meta["synced_at"],
+        "checkpoint_usn": meta["checkpoint_usn"],
+        "index_bytes": os.path.getsize(index_path_opt),
+    }
+    try:
+        journal = liveindex.query_journal(meta["drive"])
+        info["journal_id"] = f"0x{journal.journal_id:016x}"
+        info["journal_next_usn"] = journal.next_usn
+        info["pending_records_estimate"] = journal.next_usn - meta["checkpoint_usn"]
+        if journal.journal_id != meta["journal_id"]:
+            info["incremental_ok"] = False
+            info["reason"] = "the journal was reset; rebuild required"
+        elif meta["checkpoint_usn"] < journal.first_usn:
+            info["incremental_ok"] = False
+            info["reason"] = "the journal has wrapped past the checkpoint; rebuild required"
+        else:
+            info["incremental_ok"] = True
+    except liveindex.JournalUnavailable as exc:
+        info["incremental_ok"] = False
+        info["reason"] = str(exc)
+
+    if info.get("incremental_ok"):
+        sync_line = "  incremental sync: available"
+    else:
+        sync_line = f"  incremental sync: NOT available — {info.get('reason')}"
+
+    output(
+        info,
+        f"{info['entries']:,} entries from {index_path_opt} "
+        f"({info['index_bytes'] / 1024 / 1024:.1f} MB)\n"
+        f"  built {info['built_at'] or '?'}, synced {info['synced_at'] or 'never'}\n"
+        f"{sync_line}",
+    )
+
+
+@index_group.command("find")
+@click.argument("pattern")
+@click.option("--index", "index_path_opt", required=True, help="Index file to query.")
+@click.option("--limit", "-n", type=int, default=50, show_default=True)
+@click.option("--min-size", default=None, help="Only rows at least this big, e.g. 100m.")
+@with_globals
+@handle_error
+def index_find(pattern, index_path_opt, limit, min_size):
+    """Substring-match paths inside the index (no disk access at all)."""
+    from cli_anything.wiztree.core import liveindex
+
+    index = liveindex.LiveIndex.load(index_path_opt)
+    threshold = query_mod.parse_size(min_size) or 0
+    needle = pattern.lower()
+    started = time.perf_counter()
+
+    rows = []
+    for frn, node in index.nodes.items():
+        if needle not in node.name.lower():
+            continue
+        size = index.totals.get(frn, (node.size, 0))[0] if node.is_dir else node.size
+        if size < threshold:
+            continue
+        rows.append({"path": index.path_of(frn), "size": size, "is_dir": node.is_dir})
+
+    rows.sort(key=lambda row: row["size"], reverse=True)
+    elapsed = round(time.perf_counter() - started, 2)
+    payload = {
+        "index_path": index_path_opt,
+        "pattern": pattern,
+        "matches": len(rows),
+        "query_seconds": elapsed,
+        "results": rows[:limit],
+    }
+    body = "\n".join(f"  {r['size']:>15,}  {r['path']}" for r in rows[:limit])
+    output(payload, f"{len(rows):,} match(es) in {elapsed}s\n{body}")
+
+
+@index_group.command("top")
+@click.option("--index", "index_path_opt", required=True, help="Index file to query.")
+@click.option("--top", "-n", type=int, default=20, show_default=True)
+@click.option("--files", "files_only", is_flag=True, help="Largest files instead of folders.")
+@with_globals
+@handle_error
+def index_top(index_path_opt, top, files_only):
+    """Largest folders (recursive totals) or largest files, straight from the index."""
+    from cli_anything.wiztree.core import liveindex
+
+    index = liveindex.LiveIndex.load(index_path_opt)
+    started = time.perf_counter()
+
+    if files_only:
+        candidates = [(frn, n.size) for frn, n in index.nodes.items() if not n.is_dir]
+        label = "file"
+    else:
+        if not index.totals:
+            # Older index without stored totals: fall back to a full roll-up.
+            index.rebuild_totals()
+        candidates = [(frn, value[0]) for frn, value in index.totals.items()]
+        label = "folder"
+
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    rows = []
+    for frn, size in candidates[:top]:
+        rows.append({
+            "path": index.path_of(frn),
+            "size": size,
+            "size_human": query_mod.human_size(size),
+        })
+
+    elapsed = round(time.perf_counter() - started, 2)
+    payload = {
+        "index_path": index_path_opt,
+        "kind": label,
+        "query_seconds": elapsed,
+        "results": rows,
+    }
+    body = "\n".join(f"  {r['size']:>15,}  {r['path']}" for r in rows)
+    output(payload, f"top {len(rows)} {label}s (query {elapsed}s)\n{body}")
 
 
 # ── REPL ──────────────────────────────────────────────────────────────

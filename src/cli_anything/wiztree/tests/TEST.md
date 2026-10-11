@@ -17,6 +17,40 @@ Repository: `wiztree-cli` (standalone)
 | **F2** | **CSV 表头随系统语言本地化** | 中文系统实测首行 banner `生成由 WizTree 4.27 ... (您可以通过捐赠隐藏此信息)`，表头 `文件名称,大小,分配,修改时间,属性,文件,文件夹` | 解析器**必须按列位置**取值，禁止按列名/`csv.DictReader` 读取 |
 | **F3** | **列数不稳定**，默认会在首条记录追加 `DRIVECAPACITY,FREESPACE,USEDSPACE,RESERVEDSPACE`（7 列 → 11 列） | 不带 `/exportdrivecapacity=0` 时 header 11 列；带上后稳定 7 列 | 必须**显式 pin 所有 advanced flag**，否则同一份代码对同一份数据解析结果不同 |
 
+**Part 0b — 在真实 331 GB 卷（D:）上驱动本 CLI 时追加实测的四条**（对应 F4–F7）：
+
+| # | 实测结论 | 证据 | 对设计的强制约束 |
+|---|---|---|---|
+| **F4** | **`/admin=1` 是自我提权**：WizTree 经 `ShellExecute(runas)` 重启自己，CLI 启动的那个进程秒回，提权子进程才在真正扫描 | D: 全盘 `--admin`：父进程返回后 CLI 只等了 15 s 就报 "produced no output"，而 WizTree64.exe 仍在跑（工作集 ~2 GB），34 s 后 CSV 才落地 | 不能用固定 post-return grace；**探到活跃 WizTree 进程就必须把等待放宽到 `--timeout`** |
+| **F5** | **导出是流式的，且写入期间被独占锁** | CSV 在数秒内就非空，随后 3.7 MB → 818 MB 持续增长；期间 `open(rb)` 抛 `PermissionError`（文件被另一进程占用） | 「文件存在且非空」≠「已完成」，否则解析到**截断**文件；完成判定 = **无写入进程 + size 停止变化 + 可打开** |
+| **F6** | **`query *` 每次都会重新完整解析导出** | `Project.entries()` → `parse_export_csv`；653k 行 / 99 MB 实测 `query summary` **18.2 s**，且每问一次都要重付 | 大导出必须**旁路缓存已解析索引**，签名 `(size, mtime_ns, version)` 失效 |
+| **F7** | **解析热点不是 CSV 解析，而是逐字段 Python 整数转换** | cProfile：`_to_int` 调用 **3,264,770** 次累计 13.68 s；`_is_int` 正则 2.53 s；`str.strip` 9,794,328 次 3.42 s；而 `csv.reader` 本体仅 3.57 s | 热路径必须走 `int(value)` / `isdigit()` 快路径；`WizTreeEntry` 加 `slots` |
+
+**F4–F7 的性能数据（653k 行 / 99 MB folders-only 导出）**：
+
+| 阶段 | 优化前 | 优化后 |
+|---|---:|---:|
+| 冷解析 | 18.2 s | **8.2 s** |
+| 重复查询（缓存命中） | 18.2 s | **3.8 s** |
+| 缓存加载（纯 pickle） | — | 2.86 s |
+| 缓存体积 | — | 121.7 MB |
+
+同一次实测还给出了导出模式的选择依据：**folders-only 653k 行 / 103 MB / 24.7 s；全量文件级 8.14 M 行 / 818 MB / 数分钟**。回答「什么占满了盘」时，文件夹行就是全部答案。
+
+**Part 0c — 做增量索引（`core/mft.py` + `core/liveindex.py`）时实测的六条**（F8–F13）：
+
+| # | 实测结论 | 证据 | 对设计的强制约束 |
+|---|---|---|---|
+| **F8** | **扫「文件夹」时 WizTree 给的是合成编号；只有扫「整个卷」才是真实 MFT 记录号** | 扫 `D:\project_GIT\wiztree-cli` 报 `MFTRECNO=5`（5 即卷根 `$Root`）；`fsutil file queryfileid` 与 USN 都说真实值是 **3665549**。改扫 `D:` 后报 **3665549**，三方一致 | 增量索引**必须扫卷**，否则 FRN 完全对不上 |
+| **F9** | **USN 的 FileReferenceNumber 是 64 位**：低 48 位是记录号，高 16 位是记录被复用时的序列号 | `README.md` 的 `fsutil` File ID 低 48 位 = **11839**，USN 也报 **11839**；但原始 64 位值是 `0x001B000000002E3F` | 与 `MFTRECNO` join 前**必须掩码低 48 位**，否则一条都匹配不上 |
+| **F10** | **`FSCTL_READ_USN_JOURNAL` 在 `StartUsn` 靠近 `NextUsn` 时报 `ERROR_INVALID_PARAMETER`(87)，但从 `FirstUsn` 读永远成功** | `start=NextUsn-20000` + 1MB/64KB 缓冲 → 87；`start=FirstUsn` → 3364 条；`start=NextUsn-20000` + 8B 缓冲 → 成功但 0 条 | 必须有「全量重放日志 + 按 USN 过滤」的兜底；日志上限 32 MB ⇒ 有界（实测 1 MB ≈ 3364 条） |
+| **F11** | **USN 记录名必须按记录自身长度裁剪，且必须校验记录版本** | 不裁剪时新建文件名变成 `_verify_probe.bin`勃錸蓱`，`os.stat` 失败 ⇒ 大小静默为 0 | 名字切片上界 = `min(name_end, record_end)`；`MajorVersion != 2` 的布局（V3/V4 引用是 128 位）必须拒绝并计数 |
+| **F12** | **`$MFT` 是定长记录的平坦数组，天然可并行分片** | 单进程 5.55 M 条 88 s；跳过空闲记录的拷贝后 59.5 s；8 进程分片后 **27.2 s** | 字节范围天然对齐记录边界，分片无需任何协调 |
+| **F13** | **`$FILE_NAME` 里的 `AllocatedSize` 不可用（常为 0），真实分配大小在 `$DATA`** | 同一文件：`$FILE_NAME` 给 allocated=0；改用非驻留 `$DATA` 偏移 40 后得 **16384**（13837 字节 → 4 簇 × 4096） | 分配大小只从 `$DATA` 取；驻留数据的内容长度是 32 位字段（偏移 16），不是 64 位 |
+
+还有一个**性能陷阱**值得记录：删除目录时若用「线性扫描子表反查父节点」，复杂度是 O(删除数 × 目录数)。实测 1040 次删除把一次 sync 从 31 s 拖到 **122.7 s**；改为调用方直接传入父节点后回落到 31 s。
+
+
 补充实测：`/export` 单次约 1.2s（20MB 目录）；`/exportfiletypes` 产出独立 schema（`扩展名,文件类型,百分比,大小,分配,文件`）；官方指南 + 二进制串双重核对确认参数表，网上流传的 `/drive:C:` `/maxdepth:` 是**错误**写法（真实为位置参数 + `/exportmaxdepth=n`）。
 
 ---
@@ -42,8 +76,13 @@ Repository: `wiztree-cli` (standalone)
 | `utils/wiztree_backend.py` | `find_wiztree` | 显式路径命中；env `WIZTREE_EXE` 优先；找不到抛错且错误信息含下载地址 | 4 |
 | `utils/wiztree_backend.py` | `build_export_args` | **F3 回归**：必须包含 pin schema 的 advanced flag；filter/exclude/admin/sortby/maxdepth 映射；`/exportmaxdepth` 而非 `/maxdepth` | 8 |
 | `utils/wiztree_backend.py` | `run_export` | **F1 回归**：子进程 exit 0 但无产出文件 → 必须抛 `WizTreeExportError`，不得静默成功 | 3 |
+| `utils/wiztree_backend.py` | `_wait_for_complete_artifact` | **F4/F5 回归**：活跃写入进程否决完成；size 未稳定不算完成；独占锁报「仍在写」而非裸 `PermissionError` | 3 |
+| `utils/wiztree_backend.py` | `_run_and_validate` | **F4 回归**：探到活跃写入进程时等待放宽到 `--timeout`；无写入进程时保留短 grace（失败不能变慢） | 2 |
+| `core/index.py` | `parse_export_csv` 缓存 | **F6 回归**：命中返回等价数据；导出变更即失效；env 可禁用；< 4 MB 不缓存；损坏缓存回退解析；**投毒 pkl 不得执行代码** | 6 |
+| `core/index.py` | `_to_int` / `_is_int` | **F7 回归**：快路径不得改变接受的语言（空格/引号/正负号/浮点/U+FF11 全角数字） | 22 |
+| `core/index.py` | `_sniff_encoding` | 流式解析的编码判定：UTF-8 BOM / cp936 中文 banner / UTF-16 BOM；cp936 全流程往返 | 4 |
 
-合计约 **85** 条单元测试。
+合计 **167** 条单元测试（F4–F7 追加 37 条）。
 
 ### 1.2 E2E 测试 `tests/test_full_e2e.py`（必须调真实 WizTree，无降级）
 

@@ -83,6 +83,22 @@ cli-anything-wiztree query top -n 20 --json
    question is scoped: `scan run "D:\projects"` is far faster than `scan run "D:"`.
 6. **`--all-dates`, `--split-name`, `--drive-capacity` change the CSV schema.** They
    are off by default precisely so repeated scans stay comparable.
+7. **Ask a capacity question with `--folders-only`.** Measured on a 331 GB volume:
+   folder rows were 653k rows / 103 MB / 24.7 s, where the default file-level
+   export was 8.14 M rows / 818 MB and took minutes. If the question is "what is
+   filling this disk", the folder rows *are* the answer — the file rows cost ~8×
+   the time and ~8× the disk to say the same thing. Add `--max-depth N` to cut it
+   further.
+8. **`--admin` self-elevates, so budget for a UAC prompt and a slower return.**
+   WizTree relaunches itself elevated; the launcher returns in seconds while the
+   scan continues. The CLI waits for the real end (no writer process, size
+   settled, file readable), so a bare `--timeout` is the honest bound — do not
+   read an early launcher return as progress.
+9. **Repeat questions about one scan are cheap.** The parsed index is memoized in
+   `<export>.wiztree-index.pkl`, keyed on the export's size and mtime; a hit costs
+   3.8 s against 8.2 s to re-parse a 653k-row export. The sidecar is ~1.2× the
+   export size on disk — delete it to reclaim the space, and set
+   `CLI_ANYTHING_WIZTREE_NO_CACHE=1` to stop it being written.
 
 ## Examples
 
@@ -114,7 +130,10 @@ cli-anything-wiztree --project c.json query top -n 10
 |---|---|---|
 | `WizTree not found` with a download URL | Not installed / not on PATH | Install it, or set `WIZTREE_EXE`, or pass `--exe` |
 | `... but produced no output CSV export` | Target missing or unreadable, output dir not writable, or non-NTFS volume | Check the target path; use `--admin` if elevation is needed |
-| Scan is very slow on a whole drive | Running unelevated | Pass `--admin` (accepts a UAC prompt) |
+| Error names `PermissionError` on the CSV | A streamed export still held by its writer | No longer reachable: completion waits for the writer to exit. If you see it, the export was read by a second process mid-scan |
+| Scan is very slow on a whole drive | Running unelevated | Pass `--admin` (accepts a UAC prompt). If a UAC prompt cannot be accepted, the unelevated walk is the only option and it is slow by construction |
+| `--admin` returns fast but reports no CSV | It no longer should — the CLI waits for the elevated child | Update; and check the UAC prompt was actually accepted |
+| Every `query` on a big export takes ~10 s | Parse cost, on the first run only | Second run hits the sidecar index (3.8 s). Use `--folders-only` / `--max-depth` for a smaller export |
 | `Project has no scan attached` | `query` before any `scan`, or wrong `--project` | Run `scan run <target>` first |
 | Duplicates look wrong | Name+size matching cannot see content differences | Verify before deleting — the output says so too |
 
