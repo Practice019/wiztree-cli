@@ -32,6 +32,13 @@ Use it whenever a task involves *what is taking up space on a Windows disk*:
 | **WizTree 3.18+** installed — <https://diskanalyzer.com/download> | Closed-source and **not redistributable**. Without it every `scan`, `query`, `export` and `index build` fails. |
 | **Python 3.10+** | `pip install .` from the repository root |
 
+The project itself is self-contained — pure Python, two PyPI dependencies, and no
+machine-specific path in the source. WizTree is the only external piece.
+
+**Never try to bundle WizTree.** Its free edition is "Personal use only — Commercial
+use not allowed"; packaging it with an application needs a paid Distribution License
+(US$1,200/year). Direct the user to install it themselves.
+
 Always confirm the environment before promising anything:
 
 ```bash
@@ -45,6 +52,30 @@ cli-anything-wiztree --json info
 
 `is_admin: false` is **normal and usable** — WizTree falls back to walking
 directories, which works but is slower on large drives.
+
+### If discovery misses the installation
+
+`info` reports which route won in `source`. Bind it, highest priority first:
+
+```powershell
+# per invocation — touches nothing on disk
+cli-anything-wiztree --exe "D:\tools\WizTree\WizTree64.exe" scan run "C:"
+
+# per shell session
+$env:WIZTREE_EXE = "D:\tools\WizTree\WizTree64.exe"
+
+# permanent: `info` is the only command that writes config, and only after
+# printing what it found
+cli-anything-wiztree --exe "D:\tools\WizTree\WizTree64.exe" info --json
+#   -> <state home>/config.json  {"exe": "D:\\tools\\WizTree\\WizTree64.exe"}
+
+# hand-edit config.json to list several candidates
+#   {"exe": "...", "search_paths": ["E:\\portable\\WizTree\\WizTree64.exe"]}
+```
+
+After the permanent route, later commands report `source: "config"` and need no
+`--exe`. `found: false` also returns `download_url` and the full candidate list it
+tried — read that before concluding WizTree is absent.
 
 > **`--admin` elevates WizTree, not you.** It makes WizTree relaunch itself via
 > `ShellExecute(runas)`; your own process stays unelevated, so the USN journal and

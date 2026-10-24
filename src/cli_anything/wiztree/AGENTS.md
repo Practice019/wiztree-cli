@@ -42,11 +42,48 @@ Verify these before promising the user anything.
 | **Windows** | WizTree is Windows-only. There is no Linux/macOS build to drive. | `os.name == 'nt'` |
 | **WizTree 3.18+ installed** | Closed-source and **not redistributable**. Without it, `scan`, `query`, `export` and `index build` all fail — `index build` uses WizTree's `/dumpmftfile=` to obtain the raw `$MFT`. | `cli-anything-wiztree --json info` |
 | **Python 3.10+** | Uses `X \| Y` unions and `slots=True` dataclasses | `python --version` |
-| **Elevation** (MFT index only) | The raw volume handle `\\.\C:` and the USN journal both require admin | `info` reports `is_admin` |
 
-**`--admin` elevates WizTree, not you.** It makes WizTree relaunch itself through
-`ShellExecute(runas)`. Your own Python process stays unelevated, so the USN journal
-still fails:
+The project itself is self-contained: pure Python, two PyPI dependencies, and **no
+machine-specific path in the source** (`DEFAULT_SEARCH_PATHS` is deliberately
+empty). WizTree is the only external piece.
+
+**Do not try to bundle WizTree.** Its free edition is licensed "Personal use only —
+Commercial use not allowed", and packaging it with an application requires a paid
+Distribution License (US$1,200/year, <https://diskanalyzer.com/distribution-license>).
+Tell the user to install it themselves; that is what the discovery chain is for.
+
+### Binding WizTree when discovery misses it
+
+`info` reports which route won in `source`. Four ways to bind, highest priority
+first:
+
+```powershell
+# 1. per invocation, touches nothing on disk
+cli-anything-wiztree --exe "D:\tools\WizTree\WizTree64.exe" scan run "C:"
+
+# 2. per shell session
+$env:WIZTREE_EXE = "D:\tools\WizTree\WizTree64.exe"
+
+# 3. permanent: `info` is the only command that writes config, and only after
+#    printing what it found
+cli-anything-wiztree --exe "D:\tools\WizTree\WizTree64.exe" info --json
+#    -> <state home>/config.json becomes {"exe": "D:\\tools\\WizTree\\WizTree64.exe"}
+
+# 4. hand-edit config.json to list several candidates
+#    {"exe": "...", "search_paths": ["E:\\portable\\WizTree\\WizTree64.exe"]}
+```
+
+After route 3, every later command reports `source: "config"` and needs no
+`--exe`. A remembered path that has since moved is skipped and discovery falls
+through to the registry, so a moved install does not poison later runs.
+
+`found: false` also returns `download_url` and the full candidate list it tried —
+read that before assuming WizTree is absent.
+
+**Elevation is separate from binding.** `index build` / `index sync` read `\\.\C:`
+and the USN journal, which need administrator rights. `--admin` elevates WizTree
+only — it relaunches itself through `ShellExecute(runas)` — so the process that
+opens the volume still fails with `WinError 5`:
 
 ```json
 {"error": "cannot open \\\\.\\C: for reading (WinError 5); reading the USN journal needs elevation",

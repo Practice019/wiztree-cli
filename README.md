@@ -81,51 +81,133 @@ pip install -e .
 
 ## Using this on another machine
 
-The code is portable; the environment is not. What travels and what does not:
+The project is self-contained: it is pure Python, its two runtime dependencies
+(`click`, `prompt-toolkit`) come from PyPI, and no machine-specific path exists in
+the source — `DEFAULT_SEARCH_PATHS` is deliberately empty. Clone it anywhere, on
+any Windows machine, and it works.
 
-| Piece | Travels with the clone? |
-|---|---|
-| All Python code, tests, docs | ✅ yes |
-| Runtime dependencies (`click`, `prompt-toolkit`) | ✅ resolved from PyPI by `pip install .` |
-| Any machine-specific path | ✅ none exist — `DEFAULT_SEARCH_PATHS` is deliberately empty |
-| State directory | ✅ defaults to `~/.cli-anything-wiztree`, overridable with `CLI_ANYTHING_WIZTREE_HOME` |
-| **WizTree itself** | ❌ **no** — install it separately from <https://diskanalyzer.com/download> |
-| **A scan index / project file** | ❌ no — they are machine-local; rebuild on the new machine |
-| **Elevation for `index build` / `index sync`** | ❌ no — the new machine needs its own admin shell |
-
-Checklist on a new machine:
+There is exactly **one** external requirement: WizTree itself.
 
 ```powershell
 git clone https://github.com/Practice019/wiztree-cli
 cd wiztree-cli
 pip install .
-
-cli-anything-wiztree --json info        # expect found: true
 ```
 
-If `info` reports `found: false`, point discovery at the binary instead of
-hunting through the source:
+### Why WizTree is not bundled
+
+WizTree is proprietary software by Antibody Software Limited. Its free edition is
+licensed **"Personal use only — Commercial use not allowed"**, and packaging it
+with your own application requires a paid [Distribution
+License](https://diskanalyzer.com/distribution-license) (US$1,200/year). That is a
+licensing cost, not a technical obstacle — so this project ships no WizTree
+binaries, no installer, and no portable copy. You install it yourself:
+
+<https://diskanalyzer.com/download>
+
+Install the normal installer and discovery will usually find it with no
+configuration at all. If you use the portable build, or installed it somewhere
+unusual, bind it explicitly (next section).
+
+### Binding WizTree — three ways, in order of persistence
+
+**1. Permanent (recommended).** Run `info` once with `--exe`. The `info` command is
+the only one that writes configuration, and it does so *after* printing what it
+found, so nothing is remembered silently:
 
 ```powershell
-$env:WIZTREE_EXE = "C:\Program Files\WizTree\WizTree64.exe"
+cli-anything-wiztree --exe "D:\tools\WizTree\WizTree64.exe" info --json
 ```
 
-`index build` and `index sync` need an **elevated shell** — `--admin` elevates
-WizTree only, not the process reading `\\.\C:` or the USN journal:
+That writes `<state home>/config.json`:
+
+```json
+{ "exe": "D:\\tools\\WizTree\\WizTree64.exe" }
+```
+
+Every later command finds it with `source: "config"` and needs no `--exe`. A
+remembered path that has since moved is skipped, and discovery falls through to
+the registry — a moved install does not poison every later run.
+
+**2. Per shell session.** Set the environment variable; it outranks the saved
+config:
+
+```powershell
+$env:WIZTREE_EXE = "D:\tools\WizTree\WizTree64.exe"
+cli-anything-wiztree info --json      # source: "$WIZTREE_EXE"
+```
+
+```bash
+export WIZTREE_EXE=/mnt/d/tools/WizTree/WizTree64.exe   # Git Bash / WSL interop
+```
+
+**3. Per invocation.** Highest priority, changes nothing on disk:
+
+```powershell
+cli-anything-wiztree --exe "D:\tools\WizTree\WizTree64.exe" scan run "C:"
+```
+
+**4. As a last resort, edit the config directly.** Useful for pointing at several
+candidate locations, which `--exe` cannot express:
+
+```json
+{
+  "exe": "D:\\tools\\WizTree\\WizTree64.exe",
+  "search_paths": ["E:\\portable\\WizTree\\WizTree64.exe"]
+}
+```
+
+Verify whichever route you chose:
+
+```powershell
+cli-anything-wiztree --json info
+```
+
+```json
+{"found": true, "exe": "D:\\tools\\WizTree\\WizTree64.exe",
+ "source": "config", "version": "4.27.0.0", "is_admin": false}
+```
+
+`found: false` also prints `download_url` and the full candidate list it tried,
+which is usually enough to see why discovery missed your installation.
+
+### Elevation
+
+`index build` and `index sync` read the raw volume (`\\.\C:`) and the NTFS USN
+journal, which require administrator rights. `--admin` elevates **WizTree only** —
+it makes WizTree relaunch itself through `ShellExecute(runas)` — so the process
+that opens the volume still fails with `WinError 5`. Run the whole CLI from an
+elevated shell for those two commands:
 
 ```powershell
 Start-Process pwsh -Verb RunAs
 cli-anything-wiztree index build "C:" -o index_C.live
 ```
 
-A machine without WizTree can still run the unit suites (200 tests):
+Every other command works unelevated.
+
+### What is not portable, and why it does not matter
+
+Scans, indexes and project files are **outputs, not part of the project**. They
+live in the state directory and are rebuilt in one command on the new machine:
+
+```powershell
+cli-anything-wiztree index build "C:" -o index_C.live     # 22-102 s, machine-local
+```
+
+Moving a 123 MB index between machines would be pointless anyway: it describes the
+*old* machine's disk. Nothing in the checkout depends on them.
+
+### Running the tests without WizTree
+
+The 200 unit tests need no WizTree at all:
 
 ```bash
 python -m pytest src/cli_anything/wiztree/tests/test_core.py \
                  src/cli_anything/wiztree/tests/test_liveindex.py -q
 ```
 
-The 24 E2E tests drive the real binary and will fail, not skip, without it.
+The 24 E2E tests drive the real binary and **fail rather than skip** without it.
 
 ## Quick start
 
