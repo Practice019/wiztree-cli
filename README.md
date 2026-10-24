@@ -57,6 +57,10 @@ it, `scan`, `query`, `export` and `index build` all fail — `index build` obtai
 the raw `$MFT` through WizTree's `/dumpmftfile=` switch. A fresh clone with
 WizTree missing installs fine and then does nothing.
 
+You do not have to install it by hand: [`setup.ps1`](setup.ps1) downloads the
+portable build from the vendor and binds it for you. See
+[One-shot setup](#one-shot-setup-downloads-and-binds-wiztree-for-you).
+
 ## Install
 
 ```bash
@@ -67,6 +71,48 @@ pip install .
 # verify — this is the only command that works without WizTree installed
 cli-anything-wiztree info --json
 ```
+
+### One-shot setup (downloads and binds WizTree for you)
+
+```powershell
+.\setup.ps1
+```
+
+That is the whole thing. The script checks preconditions, looks for an existing
+WizTree, downloads the portable build from the vendor if there is none, extracts
+it to `%LOCALAPPDATA%\WizTree`, binds it via `info --exe`, then verifies with a real
+scan:
+
+```
+[1] Looking for an existing WizTree
+    OK    Found WizTree 4.33.0.0
+[2] Downloading WizTree from the vendor
+    OK    downloaded 7.5 MB in 12.0s
+    OK    extracted: C:\Users\you\AppData\Local\WizTree\WizTree64.exe
+[3] Binding WizTree to the CLI
+    OK    bound, saved to ...\.cli-anything-wiztree\config.json
+[4] Verifying
+    OK    found: true   source: config   version: 4.33.0.0
+    OK    scan works: 27,734 folders in 4.0s
+```
+
+Options:
+
+| Flag | Effect |
+|---|---|
+| `-InstallDir D:\tools\WizTree` | Extract somewhere other than `%LOCALAPPDATA%\WizTree` |
+| `-SetupExe` | Use the vendor installer instead of the portable build (prompts for UAC) |
+| `-Force` | Re-download even when a working WizTree is already bound |
+| `-SkipScan` | Skip the final smoke-test scan |
+
+**This is not redistribution.** The script fetches the archive from
+`diskanalyzer.com` onto the user's own machine at the user's own request, which is
+what the WizTree EULA permits. Nothing WizTree-related is stored in this
+repository — see [Why WizTree is not bundled](#why-wiztree-is-not-bundled).
+
+If you prefer to do it by hand, install WizTree from
+<https://diskanalyzer.com/download> and bind it as described in
+[Binding WizTree](#binding-wiztree--three-ways-in-order-of-persistence).
 
 For development (edits take effect immediately):
 
@@ -471,6 +517,8 @@ for the test plan, the reconnaissance findings, the recorded results, and the
   a gated destructive-operation protocol
 - [`SKILL.md`](SKILL.md) — the agent-facing skill definition (also shipped inside
   the package at `cli_anything/wiztree/skills/SKILL.md`)
+- [`setup.ps1`](setup.ps1) / [`setup.sh`](setup.sh) — one-shot install-and-bind
+  scripts; download WizTree from the vendor onto the user's machine
 - [`docs/WIZTREE.md`](docs/WIZTREE.md) — the software SOP: architecture analysis,
   GUI→CLI command map, measured behaviours, rendering gap assessment
 - [`src/cli_anything/wiztree/README.md`](src/cli_anything/wiztree/README.md) — the

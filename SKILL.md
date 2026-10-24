@@ -77,6 +77,23 @@ After the permanent route, later commands report `source: "config"` and need no
 `--exe`. `found: false` also returns `download_url` and the full candidate list it
 tried — read that before concluding WizTree is absent.
 
+### If WizTree is genuinely not installed
+
+Run the repository's setup script rather than fetching a binary yourself:
+
+```powershell
+.\setup.ps1                       # portable build -> %LOCALAPPDATA%\WizTree
+.\setup.ps1 -InstallDir D:\tools\WizTree
+.\setup.ps1 -SetupExe             # vendor installer instead, prompts for UAC
+.\setup.ps1 -Force                # re-download even if one is already bound
+.\setup.ps1 -SkipScan             # skip the smoke-test scan
+```
+
+It downloads from `diskanalyzer.com` onto the user's machine — permitted — and
+never bundles WizTree in the repository. Measured: 7.5 MB in ~12 s, then extract,
+bind and verify. It exits non-zero with a named reason on every failure path.
+Confirm afterwards with `cli-anything-wiztree --json info`.
+
 > **`--admin` elevates WizTree, not you.** It makes WizTree relaunch itself via
 > `ShellExecute(runas)`; your own process stays unelevated, so the USN journal and
 > the raw `\\.\C:` handle still fail with `WinError 5`. For `index build`/`sync`,

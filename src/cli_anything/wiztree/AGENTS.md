@@ -80,6 +80,31 @@ through to the registry, so a moved install does not poison later runs.
 `found: false` also returns `download_url` and the full candidate list it tried —
 read that before assuming WizTree is absent.
 
+### When WizTree is genuinely missing: run `setup.ps1`
+
+Do not attempt to download WizTree's binary yourself and do not place one in the
+workspace. Run the repository's setup script instead — it fetches the archive from
+the vendor onto the user's machine, which is what the EULA permits:
+
+```powershell
+.\setup.ps1                       # portable build -> %LOCALAPPDATA%\WizTree
+.\setup.ps1 -InstallDir D:\tools\WizTree
+.\setup.ps1 -SetupExe             # vendor installer instead, prompts for UAC
+.\setup.ps1 -Force                # re-download even if one is already bound
+.\setup.ps1 -SkipScan             # skip the smoke-test scan
+```
+
+It exits non-zero with a named reason on every failure path (no PowerShell, no
+CLI on PATH, vendor page unreachable, link not found on the page, extraction
+failed, binary rejected by `info`). Measured: 7.5 MB download in ~12 s, then
+extract, bind and verify in a few more seconds.
+
+Verify afterwards, do not assume:
+
+```bash
+cli-anything-wiztree --json info     # found: true, source: config
+```
+
 **Elevation is separate from binding.** `index build` / `index sync` read `\\.\C:`
 and the USN journal, which need administrator rights. `--admin` elevates WizTree
 only — it relaunches itself through `ShellExecute(runas)` — so the process that
