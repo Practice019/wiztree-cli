@@ -51,6 +51,12 @@ rows cost 8× the time and 8× the space to say the same thing.
 - **Python 3.10+**
 - **WizTree 3.18 or newer** installed — <https://diskanalyzer.com/download>
 
+**WizTree is a hard prerequisite and is not bundled.** It is closed-source
+software by Antibody Software Limited, so it cannot be redistributed here. Without
+it, `scan`, `query`, `export` and `index build` all fail — `index build` obtains
+the raw `$MFT` through WizTree's `/dumpmftfile=` switch. A fresh clone with
+WizTree missing installs fine and then does nothing.
+
 ## Install
 
 ```bash
@@ -58,7 +64,7 @@ git clone https://github.com/Practice019/wiztree-cli
 cd wiztree-cli
 pip install .
 
-# verify
+# verify — this is the only command that works without WizTree installed
 cli-anything-wiztree info --json
 ```
 
@@ -72,6 +78,54 @@ pip install -e .
 > site-packages, so the CLI keeps working even if you delete this checkout.
 > `pip install -e .` records a path back to the source tree instead — convenient
 > while developing, but the CLI breaks if the tree moves.
+
+## Using this on another machine
+
+The code is portable; the environment is not. What travels and what does not:
+
+| Piece | Travels with the clone? |
+|---|---|
+| All Python code, tests, docs | ✅ yes |
+| Runtime dependencies (`click`, `prompt-toolkit`) | ✅ resolved from PyPI by `pip install .` |
+| Any machine-specific path | ✅ none exist — `DEFAULT_SEARCH_PATHS` is deliberately empty |
+| State directory | ✅ defaults to `~/.cli-anything-wiztree`, overridable with `CLI_ANYTHING_WIZTREE_HOME` |
+| **WizTree itself** | ❌ **no** — install it separately from <https://diskanalyzer.com/download> |
+| **A scan index / project file** | ❌ no — they are machine-local; rebuild on the new machine |
+| **Elevation for `index build` / `index sync`** | ❌ no — the new machine needs its own admin shell |
+
+Checklist on a new machine:
+
+```powershell
+git clone https://github.com/Practice019/wiztree-cli
+cd wiztree-cli
+pip install .
+
+cli-anything-wiztree --json info        # expect found: true
+```
+
+If `info` reports `found: false`, point discovery at the binary instead of
+hunting through the source:
+
+```powershell
+$env:WIZTREE_EXE = "C:\Program Files\WizTree\WizTree64.exe"
+```
+
+`index build` and `index sync` need an **elevated shell** — `--admin` elevates
+WizTree only, not the process reading `\\.\C:` or the USN journal:
+
+```powershell
+Start-Process pwsh -Verb RunAs
+cli-anything-wiztree index build "C:" -o index_C.live
+```
+
+A machine without WizTree can still run the unit suites (200 tests):
+
+```bash
+python -m pytest src/cli_anything/wiztree/tests/test_core.py \
+                 src/cli_anything/wiztree/tests/test_liveindex.py -q
+```
+
+The 24 E2E tests drive the real binary and will fail, not skip, without it.
 
 ## Quick start
 
@@ -282,19 +336,23 @@ after showing it to you. A remembered path that has gone missing is skipped.
 ## Testing
 
 ```bash
-python -m pytest                          # all 154 (the E2E half needs WizTree installed)
-python -m pytest src/cli_anything/wiztree/tests/test_core.py      # 130 unit tests, ~2s, no WizTree needed
-python -m pytest src/cli_anything/wiztree/tests/test_full_e2e.py  # 24 E2E tests, real WizTree + real scans
-CLI_ANYTHING_FORCE_INSTALLED=1 python -m pytest                   # require the installed command, not the fallback
+python -m pytest                          # all 224 (the E2E 24 need WizTree installed)
+python -m pytest src/cli_anything/wiztree/tests/test_core.py       # 173 unit tests, ~2s, no WizTree needed
+python -m pytest src/cli_anything/wiztree/tests/test_liveindex.py  # 27 MFT/USN tests, no WizTree needed
+python -m pytest src/cli_anything/wiztree/tests/test_full_e2e.py   # 24 E2E tests, real WizTree + real scans
+CLI_ANYTHING_FORCE_INSTALLED=1 python -m pytest   # require the installed command, not the fallback
 python validate_self.py                   # 63 structural / convention checks
 ```
 
 The split is deliberate:
 
-- **`test_core.py` — 130 tests, ~2 seconds, runs anywhere.** Parser, query, project,
+- **`test_core.py` — 173 tests, ~2 seconds, runs anywhere.** Parser, query, project,
   session, argument builders and artifact validation, all on synthetic data. Every
   discovery test monkeypatches the registry / config / `PATH` providers shut, so
   these never touch a real WizTree installation. This is the suite CI runs.
+- **`test_liveindex.py` — 27 tests, no WizTree needed.** The `$MFT` record parser
+  and the USN journal applier, driven against a synthetic MFT fixture built
+  byte-by-byte in the test file, including fixups, namespaces and free records.
 - **`test_full_e2e.py` — 24 tests, real backend, no graceful degradation.** They
   invoke the actual `WizTree64.exe`, cross-check its totals against an independent
   `os.walk` (5% tolerance), and drive the CLI as a subprocess via `_resolve_cli`.
@@ -326,11 +384,17 @@ for the test plan, the reconnaissance findings, the recorded results, and the
 
 ## Documentation
 
+- [`AGENTS.md`](AGENTS.md) — **operating manual for AI agents**: command-selection
+  tables, measured numbers, the ten traps that produce silently wrong answers, and
+  a gated destructive-operation protocol
+- [`SKILL.md`](SKILL.md) — the agent-facing skill definition (also shipped inside
+  the package at `cli_anything/wiztree/skills/SKILL.md`)
 - [`docs/WIZTREE.md`](docs/WIZTREE.md) — the software SOP: architecture analysis,
   GUI→CLI command map, measured behaviours, rendering gap assessment
 - [`src/cli_anything/wiztree/README.md`](src/cli_anything/wiztree/README.md) — the
   package-level README that ships in the wheel
-- [`SKILL.md`](SKILL.md) — the agent-facing skill definition
+- [`src/cli_anything/wiztree/tests/TEST.md`](src/cli_anything/wiztree/tests/TEST.md)
+  — test plan, reconnaissance findings, recorded results, defects found and fixed
 - [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — attribution
 
 ## License

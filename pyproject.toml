@@ -53,6 +53,7 @@ packages = [
 [tool.setuptools.package-data]
 "cli_anything.wiztree" = [
     "README.md",
+    "AGENTS.md",
     "skills/*.md",
     "tests/TEST.md",
 ]

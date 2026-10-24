@@ -153,6 +153,43 @@ cli-anything-wiztree query types -n 15
 rule — it never compares contents. The output says so, and so does this README:
 verify before deleting.
 
+### `index` — build once, then stay fresh
+
+Every `scan run` re-reads the whole volume. The `index` commands pay that cost
+**once** and afterwards apply only what the NTFS USN change journal recorded.
+
+```bash
+cli-anything-wiztree index build  "D:" -o index_D.live   # once, needs an elevated shell
+cli-anything-wiztree index sync   "D:" -o index_D.live   # afterwards
+cli-anything-wiztree index status --index index_D.live
+cli-anything-wiztree index top    --index index_D.live -n 30
+cli-anything-wiztree index find   "_cache" --index index_D.live
+```
+
+Measured on a 331 GB volume (3.59 M entries) and a 120 GB volume (1.14 M records):
+
+| Operation | 331 GB | 120 GB |
+|---|---:|---:|
+| `index build` total | ~102 s | **21.7 s** |
+| `index sync` — journal read | 0.02 – 0.14 s | — |
+| `index top` query | 0.5 s | 0.12 s |
+| `index find` query | 0.2 – 1.5 s | — |
+| index file | 123 MB | 50 MB |
+
+**`--admin` elevates WizTree, not the caller.** WizTree relaunches itself through
+`ShellExecute(runas)`; the process that reads `\\.\C:` and the USN journal stays
+unelevated and fails with `WinError 5`. Run the whole CLI in an elevated shell for
+`index build` / `index sync`.
+
+`index sync` refuses rather than guesses when the delta cannot be trusted: a reset
+or wrapped journal raises `CheckpointLost` and tells you to rebuild. A non-zero
+`orphans` count means records referenced a parent the index does not hold — there
+is a hole.
+
+A full sync still costs ~31 s wall on the large volume: the journal delta is
+instant, but loading 3.59 M entries costs 18 s and rewriting the index 6 s. There
+is no daemon; the mechanism is millisecond-scale, the process lifecycle is not.
+
 ### `export` — reports for humans and agents
 
 ```bash
@@ -234,10 +271,20 @@ python -m pytest cli_anything/wiztree/tests/ -v
 CLI_ANYTHING_FORCE_INSTALLED=1 python -m pytest cli_anything/wiztree/tests/ -v
 ```
 
-Unit tests use synthetic data. E2E tests invoke the real `WizTree64.exe` and
-cross-check its numbers against an independent filesystem walk. See
-[`tests/TEST.md`](tests/TEST.md) for the plan, the reconnaissance findings, and
-the recorded results.
+224 tests in three suites:
+
+| Suite | Count | Needs WizTree? |
+|---|---:|---|
+| `test_core.py` — parser, query, project, session, arg builders | 173 | no |
+| `test_liveindex.py` — `$MFT` record parser, USN applier | 27 | no |
+| `test_full_e2e.py` — drives the real binary | 24 | **yes** |
+
+Unit tests use synthetic data; the MFT tests build records byte-by-byte, including
+fixups, namespaces and free records. E2E tests invoke the real `WizTree64.exe` and
+cross-check its numbers against an independent filesystem walk (5% tolerance). They
+**fail rather than skip** when the backend is missing — a harness whose backend
+cannot be tested is worth nothing. See [`tests/TEST.md`](tests/TEST.md) for the
+plan, the reconnaissance findings, and the recorded results.
 
 ## License
 
